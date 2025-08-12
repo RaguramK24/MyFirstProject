@@ -228,12 +228,16 @@ class ZDTableView: UIView, UICollectionViewDelegate, UICollectionViewDataSource,
         snapshotQueue.async { [weak self] in
             guard let self = self else { return }
             
+            let startTime = CACurrentMediaTime()
             let oldWindow = self.currentSectionWindow
             self.currentSectionWindow = window
             
             // OPTIMIZATION: Calculate sections to add and remove efficiently
             let sectionsToAdd = Set(window).subtracting(Set(oldWindow))
             let sectionsToRemove = Set(oldWindow).subtracting(Set(window))
+            
+            // OPTIMIZATION: Log window update metrics
+            print("🪟 Window Update - Size: \(window.count), Added: \(sectionsToAdd.count), Removed: \(sectionsToRemove.count)")
             
             // OPTIMIZATION: Only update snapshot for changes, not recreate entirely
             var newSnapshot = self.snapshot
@@ -282,6 +286,10 @@ class ZDTableView: UIView, UICollectionViewDelegate, UICollectionViewDataSource,
                     self.headerCollectionViewHeightAnchor.constant = 40
                     self.headerCollectionView.reloadData()
                 }
+                
+                // OPTIMIZATION: Log snapshot update performance
+                let duration = CACurrentMediaTime() - startTime
+                print("📊 Snapshot update completed in \(String(format: "%.3f", duration * 1000))ms")
             }
         }
     }
@@ -483,15 +491,24 @@ class ZDTableView: UIView, UICollectionViewDelegate, UICollectionViewDataSource,
             return // Fetch already in progress
         }
         
+        let fetchStartTime = CACurrentMediaTime()
+        
         // Mark as in progress
         dataFetchMap[dataPackIndex] = false
         let limit = (dataPackIndex * BATCH_SIZE) + 1
+        
+        print("📡 Starting data fetch for pack \(dataPackIndex) (section \(limit-1))")
         
         // OPTIMIZATION: Perform network/data operations on background queue
         dataOperationQueue.async { [weak self] in
             guard let self = self else { return }
             
             let completionHandler: (ZDTableModal?) -> Void = { modal in
+                // OPTIMIZATION: Log fetch performance
+                let duration = CACurrentMediaTime() - fetchStartTime
+                let status = modal != nil ? "✅" : "❌"
+                print("\(status) Data Fetch Pack \(dataPackIndex): \(String(format: "%.0f", duration * 1000))ms")
+                
                 // OPTIMIZATION: Update fetch status efficiently
                 self.dataFetchMap[dataPackIndex] = modal != nil ? true : nil
                 
@@ -562,6 +579,9 @@ extension ZDTableView: UIScrollViewDelegate
     // OPTIMIZATION: Load only first window on initialization instead of all data
     func initializeData()
     {
+        // OPTIMIZATION: Monitor initialization performance
+        let startTime = CACurrentMediaTime()
+        
         // Calculate initial window size - only load first visible window
         let availableRows = tableState?.rowData.count ?? 0
         let initialWindowSize = min(availableRows, VISIBLE_WINDOW)
@@ -587,6 +607,11 @@ extension ZDTableView: UIScrollViewDelegate
             // Apply initial snapshot on main queue
             DispatchQueue.main.async {
                 self.applySnapshotForWindow(0..<initialWindowSize)
+                
+                // OPTIMIZATION: Log initialization performance
+                let duration = CACurrentMediaTime() - startTime
+                print("📊 Initialization completed in \(String(format: "%.3f", duration * 1000))ms")
+                print("🪟 Initial window: 0..<\(initialWindowSize) (\(initialWindowSize) rows)")
             }
         }
     }
