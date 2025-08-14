@@ -444,6 +444,22 @@ class ZDTableView: UIView, UICollectionViewDelegate, UICollectionViewDataSource,
         return max(0, section / BATCH_SIZE)
     }
     
+    // OPTIMIZATION: Flush any pending window updates immediately
+    private func flushPendingWindowUpdates() {
+        windowUpdateTimer?.invalidate()
+        windowUpdateTimer = nil
+        
+        if let pendingRange = pendingWindowUpdate {
+            pendingWindowUpdate = nil
+            dataOperationQueue.async { [weak self] in
+                guard let self = self else { return }
+                let centerSection = (pendingRange.lowerBound + pendingRange.upperBound) / 2
+                let dynamicBuffer = Int(CGFloat(self.PREFETCH_BUFFER) * min(3.0, max(1.0, self.scrollVelocity / 1000.0)))
+                self.updateVisibleRangeWithDynamicBuffer(around: centerSection, buffer: dynamicBuffer, targetRange: pendingRange)
+            }
+        }
+    }
+    
     func numberOfSections(in collectionView: UICollectionView) -> Int {
         return 1
     }
@@ -543,7 +559,7 @@ class ZDTableView: UIView, UICollectionViewDelegate, UICollectionViewDataSource,
         }
     }
     
-    // OPTIMIZATION: Efficient data response processing with error handling
+    // OPTIMIZATION: Enhanced data response processing with error handling
     func loadReportResponse(reportData : ReportDataModal?) -> ZDTableModal?
     {
         guard let reportDataString = reportData?.reportDataString else {
@@ -554,6 +570,10 @@ class ZDTableView: UIView, UICollectionViewDelegate, UICollectionViewDataSource,
         if let modal = ZDCommonTable.companion.initializeTable(responseString: reportDataString) {
             // OPTIMIZATION: Add data to table state efficiently
             self.tableState?.addNextBatchData(newTableData: modal)
+            
+            // OPTIMIZATION: Mark that header update may be needed for new data
+            isHeaderUpdateNeeded = true
+            
             return modal
         }
         
@@ -570,7 +590,7 @@ extension ZDTableView: UIScrollViewDelegate
     }
     
     
-    // OPTIMIZATION: Load only first window on initialization instead of all data
+    // OPTIMIZATION: Enhanced data initialization with minimal UI blocking
     func initializeData()
     {
         // OPTIMIZATION: Monitor initialization performance
@@ -579,6 +599,9 @@ extension ZDTableView: UIScrollViewDelegate
         // Calculate initial window size - only load first visible window
         let availableRows = tableState?.rowData.count ?? 0
         let initialWindowSize = min(availableRows, VISIBLE_WINDOW)
+        
+        // OPTIMIZATION: Mark header update as needed for initial load
+        isHeaderUpdateNeeded = true
         
         // OPTIMIZATION: Async initialization to avoid blocking UI
         dataOperationQueue.async { [weak self] in
@@ -760,14 +783,22 @@ extension ZDTableView: UIScrollViewDelegate
     
     func scrollViewDidEndDragging(_ scrollView: UIScrollView, willDecelerate decelerate: Bool) {
         isScrolling = false
+        
+        // OPTIMIZATION: Flush any pending window updates when scroll ends
+        flushPendingWindowUpdates()
+        
         if !isfullview { return }
         if !decelerate {
             startHideTimer()
         }
     }
-    
+
     func scrollViewDidEndDecelerating(_ scrollView: UIScrollView) {
         isScrolling = false
+        
+        // OPTIMIZATION: Flush any pending window updates when scroll ends
+        flushPendingWindowUpdates()
+        
         if !isfullview { return }
         startHideTimer()
     }
@@ -799,6 +830,10 @@ extension ZDTableView: UIScrollViewDelegate
     
     func scrollViewDidEndScrollingAnimation(_ scrollView: UIScrollView) {
         isScrolling = false
+        
+        // OPTIMIZATION: Flush any pending window updates when scroll ends
+        flushPendingWindowUpdates()
+        
         if !isfullview { return }
         startHideTimer()
     }
