@@ -58,6 +58,12 @@ class ZDTableView: UIView, UICollectionViewDelegate, UICollectionViewDataSource,
     var visibleSectionRange = 0..<0 // Currently visible sections in viewport
     var scrollCheckTimer: Timer?
     
+    // OPTIMIZATION: Scroll throttling and center section tracking for performance
+    private var scrollThrottleTimer: Timer?
+    private var lastUpdatedCenterSection: Int = -1
+    private var pendingScrollUpdate: (() -> Void)?
+    private let scrollThrottleInterval: TimeInterval = 0.016 // ~60fps throttling
+    
     // OPTIMIZATION: Efficient data fetch tracking with pack-based indexing
     var dataFetchMap : [Int : Bool?] = [:]
     var scrollDirection : ScrollType? = nil
@@ -165,6 +171,11 @@ class ZDTableView: UIView, UICollectionViewDelegate, UICollectionViewDataSource,
     // OPTIMIZATION: Efficient cleanup with proper resource management
     func deInitialize()
     {
+        // OPTIMIZATION: Cancel throttle timers to prevent memory leaks
+        scrollThrottleTimer?.invalidate()
+        scrollThrottleTimer = nil
+        pendingScrollUpdate = nil
+        
         // OPTIMIZATION: Cancel any pending async operations
         dataOperationQueue.async { [weak self] in
             guard let self = self else { return }
@@ -173,6 +184,7 @@ class ZDTableView: UIView, UICollectionViewDelegate, UICollectionViewDataSource,
             self.dataFetchMap.removeAll()
             self.currentSectionWindow = 0..<0
             self.visibleSectionRange = 0..<0
+            self.lastUpdatedCenterSection = -1
             
             DispatchQueue.main.async {
                 // Clear UI state
@@ -210,26 +222,47 @@ class ZDTableView: UIView, UICollectionViewDelegate, UICollectionViewDataSource,
     }
     
     
-    // OPTIMIZATION: True sliding window implementation with memory cleanup
+    // OPTIMIZATION: True sliding window implementation with memory cleanup and selective header updates
     func applySnapshotForWindow(_ window: Range<Int>) {
         guard window != currentSectionWindow else { return }
+        
+        let previousWindow = currentSectionWindow
         currentSectionWindow = window
 
         // Remove all sections/items outside the new window
         let allSections = snapshot.sectionIdentifiers
         let sectionsToRemove = allSections.filter { !window.contains($0) }
-        snapshot.deleteSections(sectionsToRemove)
+        if !sectionsToRemove.isEmpty {
+            snapshot.deleteSections(sectionsToRemove)
+        }
 
         // Only add sections that are not already present
         let presentSections = Set(snapshot.sectionIdentifiers)
         let sectionsToAdd = window.filter { !presentSections.contains($0) }
 
-        for section in sectionsToAdd {
-            snapshot.appendSections([section])
-            snapshot.appendItems([UniqueItem(section: section, item: 0)], toSection: section)
+        if !sectionsToAdd.isEmpty {
+            for section in sectionsToAdd {
+                snapshot.appendSections([section])
+                snapshot.appendItems([UniqueItem(section: section, item: 0)], toSection: section)
+            }
         }
-        dataSource.apply(snapshot, animatingDifferences: false)
-        headerCollectionView.reloadData()
+        
+        // OPTIMIZATION: Only apply snapshot if there were actual changes
+        if !sectionsToRemove.isEmpty || !sectionsToAdd.isEmpty {
+            dataSource.apply(snapshot, animatingDifferences: false)
+        }
+        
+        // OPTIMIZATION: Only reload headers if window boundaries changed significantly
+        let windowBoundaryChangeThreshold = PREFETCH_BUFFER / 2
+        let lowerBoundaryChanged = abs(window.lowerBound - previousWindow.lowerBound) > windowBoundaryChangeThreshold
+        let upperBoundaryChanged = abs(window.upperBound - previousWindow.upperBound) > windowBoundaryChangeThreshold
+        
+        if lowerBoundaryChanged || upperBoundaryChanged || previousWindow.isEmpty {
+            // OPTIMIZATION: Defer header reload to avoid blocking main thread
+            DispatchQueue.main.async { [weak self] in
+                self?.headerCollectionView.reloadData()
+            }
+        }
     }
     
 //MARK: Layout
@@ -328,31 +361,36 @@ class ZDTableView: UIView, UICollectionViewDelegate, UICollectionViewDataSource,
         return nil
     }
     
-    // OPTIMIZATION: Efficient viewport-based prefetching with sliding window
+    // OPTIMIZATION: Efficient viewport-based prefetching with sliding window and redundancy prevention
     func collectionView(_ collectionView: UICollectionView, willDisplay cell: UICollectionViewCell, forItemAt indexPath: IndexPath) {
-        // OPTIMIZATION: Async prefetch decision to avoid blocking scroll
-        dataOperationQueue.async { [weak self] in
-            guard let self = self else { return }
-            
-            // Calculate current viewport and prefetch requirements
-            let currentSection = indexPath.section
-            self.updateVisibleRange(around: currentSection)
-            
-            // OPTIMIZATION: Smart prefetching based on scroll direction and speed
-            if let isVerticalDownScroll = self.isVerticalDownScroll {
-                let prefetchSection = isVerticalDownScroll ?
-                    currentSection + self.PREFETCH_BUFFER :
-                    currentSection - self.PREFETCH_BUFFER
+        // OPTIMIZATION: Only trigger prefetch for significant section changes to reduce overhead
+        let currentSection = indexPath.section
+        let sectionChangeThreshold = PREFETCH_BUFFER / 4
+        
+        if abs(currentSection - lastUpdatedCenterSection) > sectionChangeThreshold {
+            // OPTIMIZATION: Async prefetch decision to avoid blocking scroll
+            dataOperationQueue.async { [weak self] in
+                guard let self = self else { return }
                 
-                let packIndex = self.getDataPackIndex(section: prefetchSection)
+                // Update visible range around current section
+                self.updateVisibleRange(around: currentSection)
                 
-                // OPTIMIZATION: Only fetch if not already fetched or in progress
-                if self.dataFetchMap[packIndex] == nil {
-                    self.fetchNextTableData(dataPackIndex: packIndex) { startIndex, modal in
-                        DispatchQueue.main.async {
-                            if let modal {
-                                let endIndex = startIndex + Int(modal.navConfig.batchCount)
-                                self.applySnapshotForWindow(startIndex..<endIndex)
+                // OPTIMIZATION: Smart prefetching based on scroll direction and speed
+                if let isVerticalDownScroll = self.isVerticalDownScroll {
+                    let prefetchSection = isVerticalDownScroll ?
+                        currentSection + self.PREFETCH_BUFFER :
+                        currentSection - self.PREFETCH_BUFFER
+                    
+                    let packIndex = self.getDataPackIndex(section: prefetchSection)
+                    
+                    // OPTIMIZATION: Only fetch if not already fetched or in progress
+                    if self.dataFetchMap[packIndex] == nil {
+                        self.fetchNextTableData(dataPackIndex: packIndex) { startIndex, modal in
+                            DispatchQueue.main.async {
+                                if let modal {
+                                    let endIndex = startIndex + Int(modal.navConfig.batchCount)
+                                    self.applySnapshotForWindow(startIndex..<endIndex)
+                                }
                             }
                         }
                     }
@@ -361,7 +399,7 @@ class ZDTableView: UIView, UICollectionViewDelegate, UICollectionViewDataSource,
         }
     }
     
-    // OPTIMIZATION: Efficient visible range tracking for sliding window management
+    // OPTIMIZATION: Efficient visible range tracking for sliding window management with batched updates
     private func updateVisibleRange(around centerSection: Int) {
         let halfWindow = VISIBLE_WINDOW / 2
         let totalSections = Int(tableState?.currentNavConfig.totalRecord ?? 0)
@@ -372,13 +410,16 @@ class ZDTableView: UIView, UICollectionViewDelegate, UICollectionViewDataSource,
         let newRange = start..<end
         
         // OPTIMIZATION: Only update window if significant change to avoid unnecessary updates
-        if abs(newRange.lowerBound - visibleSectionRange.lowerBound) > PREFETCH_BUFFER ||
-           abs(newRange.upperBound - visibleSectionRange.upperBound) > PREFETCH_BUFFER {
+        let significantChangeThreshold = PREFETCH_BUFFER / 2
+        if abs(newRange.lowerBound - visibleSectionRange.lowerBound) > significantChangeThreshold ||
+           abs(newRange.upperBound - visibleSectionRange.upperBound) > significantChangeThreshold {
             visibleSectionRange = newRange
             
-            // Update sliding window on main queue
-            DispatchQueue.main.async { [weak self] in
-                self?.applySnapshotForWindow(newRange)
+            // OPTIMIZATION: Batch window updates using snapshot queue to avoid blocking main thread
+            snapshotQueue.async { [weak self] in
+                DispatchQueue.main.async { [weak self] in
+                    self?.applySnapshotForWindow(newRange)
+                }
             }
         }
     }
@@ -558,8 +599,23 @@ extension ZDTableView: UIScrollViewDelegate
         hideScrollButtonView()
     }
     
-    // OPTIMIZATION: Enhanced scroll performance with efficient viewport detection
+    // OPTIMIZATION: Enhanced scroll performance with throttling and efficient viewport detection
     func scrollViewDidScroll(_ scrollView: UIScrollView) {
+        // OPTIMIZATION: Throttle scroll events to reduce main thread load
+        pendingScrollUpdate = { [weak self] in
+            self?.processScrollUpdate(scrollView)
+        }
+        
+        // Cancel previous timer and start new one for throttling
+        scrollThrottleTimer?.invalidate()
+        scrollThrottleTimer = Timer.scheduledTimer(withTimeInterval: scrollThrottleInterval, repeats: false) { [weak self] _ in
+            self?.pendingScrollUpdate?()
+            self?.pendingScrollUpdate = nil
+        }
+    }
+    
+    // OPTIMIZATION: Process scroll updates with reduced frequency and better state management
+    private func processScrollUpdate(_ scrollView: UIScrollView) {
         if isScrolling { return }
         isScrolling = true
         
@@ -573,23 +629,25 @@ extension ZDTableView: UIScrollViewDelegate
             headerCollectionView.contentOffset.x = offsetX
             headerCollectionView.delegate = self
             
-            // OPTIMIZATION: Efficient viewport calculation for sliding window updates
-            updateViewportBasedWindow(scrollView: scrollView)
+            // OPTIMIZATION: Only update viewport if significant change to reduce UI load
+            updateViewportBasedWindowThrottled(scrollView: scrollView)
         }
         
         if isfullview {
-            if scrollDirection == nil
-            {
+            if scrollDirection == nil {
                 scrollDirection = getScrollDirection(currentContentOffset: scrollView.contentOffset)
             }
-            if let scrollDirection
-            {
-                if scrollDirection == .vertical {
-                    verticalScrollOptionsContainer.updateButtons(contentOffset: scrollView.contentOffset, isVerticalEnd: isVerticalEnd(scrollView: scrollView), isHorizontalEnd: isHorizontalEnd(scrollView: scrollView))
-                    showScrollButtonView(isVerticalScroll: true)
-                } else {
-                    horizontalScrollOptionsContainer.updateButtons(contentOffset: scrollView.contentOffset, isVerticalEnd: isVerticalEnd(scrollView: scrollView), isHorizontalEnd: isHorizontalEnd(scrollView: scrollView))
-                    showScrollButtonView(isVerticalScroll: false)
+            if let scrollDirection {
+                // OPTIMIZATION: Defer scroll button updates to reduce main thread work
+                DispatchQueue.main.async { [weak self] in
+                    guard let self = self else { return }
+                    if scrollDirection == .vertical {
+                        self.verticalScrollOptionsContainer.updateButtons(contentOffset: scrollView.contentOffset, isVerticalEnd: self.isVerticalEnd(scrollView: scrollView), isHorizontalEnd: self.isHorizontalEnd(scrollView: scrollView))
+                        self.showScrollButtonView(isVerticalScroll: true)
+                    } else {
+                        self.horizontalScrollOptionsContainer.updateButtons(contentOffset: scrollView.contentOffset, isVerticalEnd: self.isVerticalEnd(scrollView: scrollView), isHorizontalEnd: self.isHorizontalEnd(scrollView: scrollView))
+                        self.showScrollButtonView(isVerticalScroll: false)
+                    }
                 }
             }
         }
@@ -597,8 +655,8 @@ extension ZDTableView: UIScrollViewDelegate
         isScrolling = false
     }
     
-    // OPTIMIZATION: Efficient viewport-based window management
-    private func updateViewportBasedWindow(scrollView: UIScrollView) {
+    // OPTIMIZATION: Throttled viewport-based window management with center section tracking
+    private func updateViewportBasedWindowThrottled(scrollView: UIScrollView) {
         // Calculate which sections are currently visible
         let visibleIndexPaths = collectionView.indexPathsForVisibleItems
         guard !visibleIndexPaths.isEmpty else { return }
@@ -608,10 +666,15 @@ extension ZDTableView: UIScrollViewDelegate
         let minSection = visibleSections.min() ?? 0
         let maxSection = visibleSections.max() ?? 0
         
-        // OPTIMIZATION: Update sliding window only when necessary
+        // OPTIMIZATION: Update sliding window only when center section changes significantly
         let centerSection = (minSection + maxSection) / 2
-        dataOperationQueue.async { [weak self] in
-            self?.updateVisibleRange(around: centerSection)
+        let centerSectionChangeThreshold = PREFETCH_BUFFER / 4 // Require significant movement
+        
+        if abs(centerSection - lastUpdatedCenterSection) > centerSectionChangeThreshold {
+            lastUpdatedCenterSection = centerSection
+            dataOperationQueue.async { [weak self] in
+                self?.updateVisibleRange(around: centerSection)
+            }
         }
     }
     
@@ -656,6 +719,13 @@ extension ZDTableView: UIScrollViewDelegate
     }
     
     func scrollViewDidEndDragging(_ scrollView: UIScrollView, willDecelerate decelerate: Bool) {
+        // OPTIMIZATION: Process any pending scroll updates immediately when dragging ends
+        if let pendingUpdate = pendingScrollUpdate {
+            scrollThrottleTimer?.invalidate()
+            pendingUpdate()
+            pendingScrollUpdate = nil
+        }
+        
         isScrolling = false
         if !isfullview { return }
         if !decelerate {
@@ -664,6 +734,13 @@ extension ZDTableView: UIScrollViewDelegate
     }
     
     func scrollViewDidEndDecelerating(_ scrollView: UIScrollView) {
+        // OPTIMIZATION: Process any pending scroll updates immediately when deceleration ends
+        if let pendingUpdate = pendingScrollUpdate {
+            scrollThrottleTimer?.invalidate()
+            pendingUpdate()
+            pendingScrollUpdate = nil
+        }
+        
         isScrolling = false
         if !isfullview { return }
         startHideTimer()
@@ -695,6 +772,13 @@ extension ZDTableView: UIScrollViewDelegate
     }
     
     func scrollViewDidEndScrollingAnimation(_ scrollView: UIScrollView) {
+        // OPTIMIZATION: Process any pending scroll updates immediately when animation ends
+        if let pendingUpdate = pendingScrollUpdate {
+            scrollThrottleTimer?.invalidate()
+            pendingUpdate()
+            pendingScrollUpdate = nil
+        }
+        
         isScrolling = false
         if !isfullview { return }
         startHideTimer()
