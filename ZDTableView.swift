@@ -4,17 +4,7 @@
 //
 //  Created by Raguram K on 26/03/25.
 //  Copyright © 2025 Raguram K. All rights reserved.
-//
-//  OPTIMIZATION SUMMARY:
-//  This file has been optimized for handling very large tables (100k+ rows) with:
-//  • True virtualization with sliding window (500 rows visible + 100 row prefetch buffer)
-//  • Async data operations to prevent UI blocking
-//  • Efficient memory management with automatic cleanup of non-visible sections
-//  • Smart viewport-based prefetching
-//  • Optimized data access patterns (no large array scanning)
-//  • Batch-based data loading (200 rows per batch)
-//  • Only loads first window on initialization
-//
+
 
 import UIKit
 import zdcore
@@ -57,7 +47,7 @@ class ZDTableView: UIView, UICollectionViewDelegate, UICollectionViewDataSource,
     
     // OPTIMIZATION: Reduced window size for true virtualization - only keep 500 rows visible + prefetch buffer
     let VISIBLE_WINDOW = 500
-    let PREFETCH_BUFFER = 100 // Prefetch buffer on each side
+    let PREFETCH_BUFFER = 50 // Prefetch buffer on each side
     let BATCH_SIZE = 200 // Size of each data batch to fetch
     
     var dataSource: UICollectionViewDiffableDataSource<Int, UniqueItem>!
@@ -223,75 +213,23 @@ class ZDTableView: UIView, UICollectionViewDelegate, UICollectionViewDataSource,
     // OPTIMIZATION: True sliding window implementation with memory cleanup
     func applySnapshotForWindow(_ window: Range<Int>) {
         guard window != currentSectionWindow else { return }
-        
-        // OPTIMIZATION: Perform snapshot operations asynchronously to avoid UI blocking
-        snapshotQueue.async { [weak self] in
-            guard let self = self else { return }
-            
-            let startTime = CACurrentMediaTime()
-            let oldWindow = self.currentSectionWindow
-            self.currentSectionWindow = window
-            
-            // OPTIMIZATION: Calculate sections to add and remove efficiently
-            let sectionsToAdd = Set(window).subtracting(Set(oldWindow))
-            let sectionsToRemove = Set(oldWindow).subtracting(Set(window))
-            
-            // OPTIMIZATION: Log window update metrics
-            print("🪟 Window Update - Size: \(window.count), Added: \(sectionsToAdd.count), Removed: \(sectionsToRemove.count)")
-            
-            // OPTIMIZATION: Only update snapshot for changes, not recreate entirely
-            var newSnapshot = self.snapshot
-            
-            // Remove old sections that are out of window (memory cleanup)
-            if !sectionsToRemove.isEmpty {
-                let sectionsToRemoveArray = Array(sectionsToRemove).sorted()
-                for section in sectionsToRemoveArray {
-                    if newSnapshot.sectionIdentifiers.contains(section) {
-                        newSnapshot.deleteSections([section])
-                    }
-                }
-            }
-            
-            // Add new sections efficiently
-            if !sectionsToAdd.isEmpty {
-                let sectionsToAddArray = Array(sectionsToAdd).sorted()
-                
-                // OPTIMIZATION: Insert sections in correct position rather than just appending
-                for section in sectionsToAddArray {
-                    // Find correct insertion point
-                    let existingSections = newSnapshot.sectionIdentifiers.sorted()
-                    if let insertAfter = existingSections.last(where: { $0 < section }) {
-                        newSnapshot.insertSections([section], afterSection: insertAfter)
-                    } else if let insertBefore = existingSections.first(where: { $0 > section }) {
-                        newSnapshot.insertSections([section], beforeSection: insertBefore)
-                    } else {
-                        newSnapshot.appendSections([section])
-                    }
-                    
-                    // OPTIMIZATION: Efficient data access - direct lookup instead of scanning
-                    if let rowData = self.tableState?.rowData[KotlinInt(integerLiteral: section + 1)], !rowData.isEmpty {
-                        let items = [UniqueItem(section: section, item: 0)]
-                        newSnapshot.appendItems(items, toSection: section)
-                    }
-                }
-            }
-            
-            // Apply snapshot on main queue
-            DispatchQueue.main.async {
-                self.snapshot = newSnapshot
-                self.dataSource.apply(newSnapshot, animatingDifferences: false)
-                
-                // OPTIMIZATION: Only update header if needed
-                if oldWindow.count != window.count {
-                    self.headerCollectionViewHeightAnchor.constant = 40
-                    self.headerCollectionView.reloadData()
-                }
-                
-                // OPTIMIZATION: Log snapshot update performance
-                let duration = CACurrentMediaTime() - startTime
-                print("📊 Snapshot update completed in \(String(format: "%.3f", duration * 1000))ms")
-            }
+        currentSectionWindow = window
+
+        // Remove all sections/items outside the new window
+        let allSections = snapshot.sectionIdentifiers
+        let sectionsToRemove = allSections.filter { !window.contains($0) }
+        snapshot.deleteSections(sectionsToRemove)
+
+        // Only add sections that are not already present
+        let presentSections = Set(snapshot.sectionIdentifiers)
+        let sectionsToAdd = window.filter { !presentSections.contains($0) }
+
+        for section in sectionsToAdd {
+            snapshot.appendSections([section])
+            snapshot.appendItems([UniqueItem(section: section, item: 0)], toSection: section)
         }
+        dataSource.apply(snapshot, animatingDifferences: false)
+        headerCollectionView.reloadData()
     }
     
 //MARK: Layout
@@ -327,7 +265,7 @@ class ZDTableView: UIView, UICollectionViewDelegate, UICollectionViewDataSource,
                 }
                 
                 let itemSize = NSCollectionLayoutSize(
-                    widthDimension: .absolute(groupWidth), 
+                    widthDimension: .absolute(groupWidth),
                     heightDimension: .absolute(40)
                 )
                 items.append(NSCollectionLayoutItem(layoutSize: itemSize))
@@ -402,8 +340,8 @@ class ZDTableView: UIView, UICollectionViewDelegate, UICollectionViewDataSource,
             
             // OPTIMIZATION: Smart prefetching based on scroll direction and speed
             if let isVerticalDownScroll = self.isVerticalDownScroll {
-                let prefetchSection = isVerticalDownScroll ? 
-                    currentSection + self.PREFETCH_BUFFER : 
+                let prefetchSection = isVerticalDownScroll ?
+                    currentSection + self.PREFETCH_BUFFER :
                     currentSection - self.PREFETCH_BUFFER
                 
                 let packIndex = self.getDataPackIndex(section: prefetchSection)
